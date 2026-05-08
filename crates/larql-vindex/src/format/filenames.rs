@@ -18,6 +18,7 @@ pub const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 pub const GENERATION_CONFIG_JSON: &str = "generation_config.json";
 pub const WEIGHT_MANIFEST_JSON: &str = "weight_manifest.json";
 pub const GGUF_GATE_MANIFEST_JSON: &str = "gguf_gate_manifest.json";
+pub const GGUF_ATTENTION_MANIFEST_JSON: &str = "gguf_attention_manifest.json";
 pub const GGUF_EMBEDDINGS_MANIFEST_JSON: &str = "gguf_embeddings_manifest.json";
 pub const GGUF_DOWN_META_MANIFEST_JSON: &str = "gguf_down_meta_manifest.json";
 pub const KNN_STORE_BIN: &str = "knn_store.bin";

@@ -70,6 +70,26 @@ struct GgufEmbeddingsManifest {
 }
 
 #[derive(serde::Serialize)]
+struct GgufAttentionManifest {
+    version: u32,
+    architecture: String,
+    split_count: usize,
+    residency: String,
+    tensors: Vec<GgufAttentionManifestTensor>,
+}
+
+#[derive(serde::Serialize)]
+struct GgufAttentionManifestTensor {
+    tensor: String,
+    source_file: String,
+    shard_idx: usize,
+    tensor_type: u32,
+    dims: Vec<u64>,
+    tensor_offset: u64,
+    data_offset: u64,
+}
+
+#[derive(serde::Serialize)]
 struct GgufGateManifest {
     version: u32,
     architecture: String,
@@ -253,8 +273,10 @@ fn classify_deepseek2_layout(catalog: &GgufCatalog) -> Result<GgufDeepseek2Layou
                     .insert((layer, GgufExpertComponent::Down), name.clone());
             }
             suffix if suffix.starts_with("attn_") => {
-                // Attention tensors are intentionally not part of vindex FFN extraction,
-                // but keeping a bucket here documents that they were recognized and skipped.
+                // Attention tensors are not part of vindex FFN extraction, but keep
+                // them in the layout so manifest-backed Kimi execution can plan the
+                // dense-attention residency separately from mmap-backed experts.
+                layout.attention.push(name.clone());
             }
             _ => {}
         }
@@ -1059,6 +1081,51 @@ fn write_deepseek2_gguf_gate_manifest(
     Ok(())
 }
 
+fn write_deepseek2_gguf_attention_manifest(
+    output_dir: &Path,
+    catalog: &GgufCatalog,
+    layout: &GgufDeepseek2Layout,
+) -> Result<(), VindexError> {
+    if layout.attention.is_empty() {
+        return Ok(());
+    }
+    let mut tensors = Vec::with_capacity(layout.attention.len());
+    let mut names = layout.attention.clone();
+    names.sort();
+    for tensor in names {
+        let entry = catalog
+            .tensor(&tensor)
+            .ok_or_else(|| VindexError::MissingTensor(tensor.clone()))?;
+        let source_file = catalog.files.get(entry.shard_idx).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "GGUF tensor {} points at missing shard index {}",
+                entry.name, entry.shard_idx
+            ))
+        })?;
+        tensors.push(GgufAttentionManifestTensor {
+            tensor,
+            source_file: source_file.display().to_string(),
+            shard_idx: entry.shard_idx,
+            tensor_type: entry.tensor_type,
+            dims: entry.dims.clone(),
+            tensor_offset: entry.tensor_offset,
+            data_offset: entry.data_offset,
+        });
+    }
+
+    let manifest = GgufAttentionManifest {
+        version: 1,
+        architecture: catalog.architecture.clone(),
+        split_count: catalog.split_count,
+        residency: "split_residency_cuda_attention_mmap_experts".to_string(),
+        tensors,
+    };
+    let json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| VindexError::Parse(e.to_string()))?;
+    std::fs::write(output_dir.join(GGUF_ATTENTION_MANIFEST_JSON), json)?;
+    Ok(())
+}
+
 fn deepseek2_gguf_layer_infos(
     catalog: &GgufCatalog,
     layout: &GgufDeepseek2Layout,
@@ -1267,6 +1334,7 @@ fn build_gguf_streaming(
     let layout = classify_deepseek2_layout(catalog)?;
     let estimated_gate_bytes = estimate_deepseek2_gate_vector_bytes(catalog, &layout, dtype)?;
     std::fs::create_dir_all(output_dir)?;
+    write_deepseek2_gguf_attention_manifest(output_dir, catalog, &layout)?;
     callbacks.on_stage(STAGE_LOADING);
     callbacks.on_stage_done(STAGE_LOADING, 0.0);
     callbacks.on_stage(STAGE_EMBEDDINGS);
@@ -2301,7 +2369,7 @@ mod tests {
             layout.shared_experts.get(&(0, GgufExpertComponent::Gate)),
             Some(&"blk.0.ffn_gate_shexp.weight".to_string())
         );
-        assert!(!layout
+        assert!(layout
             .attention
             .contains(&"blk.0.attn_q_a.weight".to_string()));
     }
@@ -2387,6 +2455,60 @@ mod tests {
             .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
             .collect();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn build_gguf_streaming_writes_attention_manifest_for_split_residency_planning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let output_dir = tmp.path().join("out.vindex");
+        let shard = model_dir.join("Kimi-00001-of-00001.gguf");
+        let gate_values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        write_minimal_gguf_header(
+            &shard,
+            "deepseek2",
+            1,
+            &[
+                ("blk.0.ffn_gate_exps.weight", &[2, 2, 2], 0),
+                ("blk.0.attn_q_a.weight", &[2, 2], 0),
+            ],
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shard)
+            .unwrap();
+        let pos = f.seek(std::io::SeekFrom::End(0)).unwrap();
+        let data_offset = pos.div_ceil(32) * 32;
+        f.write_all(&vec![0u8; (data_offset - pos) as usize])
+            .unwrap();
+        for value in &gate_values {
+            f.write_all(&value.to_le_bytes()).unwrap();
+        }
+
+        let source = discover_weight_source(&model_dir).unwrap();
+        let WeightSource::Gguf(catalog) = source else {
+            panic!("expected GGUF catalog");
+        };
+        let mut callbacks = crate::extract::callbacks::SilentBuildCallbacks;
+        let tokenizer = tiny_tokenizer();
+
+        build_gguf_streaming(
+            &catalog,
+            &output_dir,
+            StorageDtype::F32,
+            &tokenizer,
+            "unit/kimi-gguf",
+            1,
+            &mut callbacks,
+        )
+        .unwrap();
+
+        let manifest =
+            std::fs::read_to_string(output_dir.join("gguf_attention_manifest.json")).unwrap();
+        assert!(manifest.contains("blk.0.attn_q_a.weight"));
+        assert!(manifest.contains("split_residency"));
     }
 
     #[test]

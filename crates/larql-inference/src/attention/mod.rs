@@ -8,6 +8,7 @@
 
 pub mod block;
 pub mod decode;
+pub mod deepseek2_mla;
 pub mod gguf_manifest;
 pub mod gpu;
 pub mod gqa;
@@ -49,9 +50,15 @@ pub use decode::{
     gqa_attention_decode_step, run_attention_block_decode_step,
     run_attention_block_decode_step_backend, KvCache,
 };
+pub use deepseek2_mla::{deepseek2_mla_single_token_cpu, Deepseek2MlaShape};
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+pub use deepseek2_mla::{
+    load_deepseek2_cuda_resident_2d_attention, Deepseek2CudaResident2dAttention,
+};
 pub use gguf_manifest::{
-    load_deepseek2_attention_manifest_plan, Deepseek2AttentionLayerPlan,
-    Deepseek2AttentionManifestPlan, GgufAttentionTensorRef,
+    load_deepseek2_attention_layer_tensors, load_deepseek2_attention_manifest_plan,
+    Deepseek2AttentionLayerPlan, Deepseek2AttentionLayerTensors, Deepseek2AttentionManifestPlan,
+    GgufAttentionTensorRef,
 };
 pub use gpu::{
     q4_attention_proj, run_attention_block_gpu, run_attention_with_kv,

@@ -4,9 +4,10 @@
 //! mmap-backed MoE expert tensors. It does not materialize tensor data yet; the
 //! next loader stage can consume the plan to decide what may be staged on CUDA.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
+use larql_models::loading::gguf::{GgufFile, LoadedGgufTensor};
 use larql_vindex::format::filenames::GGUF_ATTENTION_MANIFEST_JSON;
 use serde::Deserialize;
 
@@ -109,6 +110,91 @@ impl Deepseek2AttentionManifestPlan {
             .flat_map(|layer| layer.tensors_for_cuda_residency())
             .collect()
     }
+
+    pub fn layer(&self, layer: usize) -> Option<&Deepseek2AttentionLayerPlan> {
+        self.layers.iter().find(|plan| plan.layer == layer)
+    }
+}
+
+/// Dequantized tensor payloads for one DeepSeek2/Kimi MLA attention layer.
+#[derive(Debug)]
+pub struct Deepseek2AttentionLayerTensors {
+    pub layer: usize,
+    pub tensors: HashMap<String, LoadedGgufTensor>,
+}
+
+impl Deepseek2AttentionLayerTensors {
+    pub fn get(&self, tensor_name: &str) -> Option<&LoadedGgufTensor> {
+        self.tensors.get(tensor_name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+}
+
+pub fn load_deepseek2_attention_layer_tensors(
+    vindex_dir: &Path,
+    layer: usize,
+) -> Result<Deepseek2AttentionLayerTensors, InferenceError> {
+    let plan = load_deepseek2_attention_manifest_plan(vindex_dir)?;
+    let layer_plan = plan.layer(layer).ok_or_else(|| {
+        InferenceError::MissingTensor(format!("DeepSeek2 attention layer {layer}"))
+    })?;
+    load_deepseek2_attention_layer_tensors_from_plan(vindex_dir, layer_plan)
+}
+
+fn load_deepseek2_attention_layer_tensors_from_plan(
+    vindex_dir: &Path,
+    layer_plan: &Deepseek2AttentionLayerPlan,
+) -> Result<Deepseek2AttentionLayerTensors, InferenceError> {
+    if !layer_plan.is_mla_complete() {
+        return Err(InferenceError::MissingTensor(format!(
+            "DeepSeek2 layer {} complete MLA attention tensor set",
+            layer_plan.layer
+        )));
+    }
+
+    let mut by_source: BTreeMap<PathBuf, Vec<&GgufAttentionTensorRef>> = BTreeMap::new();
+    for tensor_ref in layer_plan.tensors_for_cuda_residency() {
+        let source = PathBuf::from(&tensor_ref.source_file);
+        let source = if source.is_absolute() {
+            source
+        } else {
+            vindex_dir.join(source)
+        };
+        by_source.entry(source).or_default().push(tensor_ref);
+    }
+
+    let mut tensors = HashMap::new();
+    for (source, refs) in by_source {
+        let gguf = GgufFile::open(&source)?;
+        for tensor_ref in refs {
+            let loaded = gguf.load_tensor_data_by_name(&tensor_ref.tensor)?;
+            if loaded
+                .dims
+                .iter()
+                .map(|dim| *dim as usize)
+                .collect::<Vec<_>>()
+                != tensor_ref.dims
+            {
+                return Err(InferenceError::Parse(format!(
+                    "GGUF tensor {} dims {:?} do not match manifest dims {:?}",
+                    tensor_ref.tensor, loaded.dims, tensor_ref.dims
+                )));
+            }
+            tensors.insert(tensor_ref.tensor.clone(), loaded);
+        }
+    }
+
+    Ok(Deepseek2AttentionLayerTensors {
+        layer: layer_plan.layer,
+        tensors,
+    })
 }
 
 pub fn load_deepseek2_attention_manifest_plan(
@@ -225,5 +311,83 @@ mod tests {
             .tensors_for_cuda_residency()
             .iter()
             .all(|tensor| tensor.tensor.contains("attn_") && !tensor.tensor.contains("ffn_")));
+    }
+
+    #[test]
+    fn deepseek2_attention_manifest_loader_reads_one_layer_tensor_payloads() {
+        use std::io::{Seek, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_path = dir.path().join("tiny-attn.gguf");
+        let tensor_names = [
+            "blk.0.attn_q_a.weight",
+            "blk.0.attn_q_a_norm.weight",
+            "blk.0.attn_q_b.weight",
+            "blk.0.attn_kv_a_mqa.weight",
+            "blk.0.attn_kv_a_norm.weight",
+            "blk.0.attn_k_b.weight",
+            "blk.0.attn_v_b.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate_exps.weight",
+        ];
+        let mut file = std::fs::File::create(&shard_path).unwrap();
+        file.write_all(&0x46554747u32.to_le_bytes()).unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&(tensor_names.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+
+        let mut offsets = Vec::new();
+        let mut running_offset = 0u64;
+        for name in tensor_names {
+            file.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
+            file.write_all(name.as_bytes()).unwrap();
+            file.write_all(&2u32.to_le_bytes()).unwrap();
+            file.write_all(&2u64.to_le_bytes()).unwrap();
+            file.write_all(&2u64.to_le_bytes()).unwrap();
+            file.write_all(&larql_models::quant::ggml::TYPE_F32.to_le_bytes())
+                .unwrap();
+            file.write_all(&running_offset.to_le_bytes()).unwrap();
+            offsets.push(running_offset);
+            running_offset += 16;
+        }
+
+        let pos = file.stream_position().unwrap();
+        let aligned = pos.div_ceil(32) * 32;
+        file.write_all(&vec![0u8; (aligned - pos) as usize])
+            .unwrap();
+        for idx in 0..tensor_names.len() {
+            for v in 0..4u32 {
+                file.write_all(&((idx as f32) + (v as f32 / 10.0)).to_le_bytes())
+                    .unwrap();
+            }
+        }
+        file.flush().unwrap();
+
+        let manifest_entries = tensor_names
+            .iter()
+            .zip(offsets.iter())
+            .map(|(name, offset)| {
+                format!(
+                    r#"{{"tensor":"{name}","source_file":"{}","shard_idx":0,"tensor_type":0,"dims":[2,2],"tensor_offset":{offset},"data_offset":0}}"#,
+                    shard_path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let manifest = format!(
+            r#"{{"version":1,"architecture":"deepseek2","split_count":1,"residency":"split_residency_cuda_attention_mmap_experts","tensors":[{manifest_entries}]}}"#
+        );
+        fs::write(dir.path().join("gguf_attention_manifest.json"), manifest).unwrap();
+
+        let loaded = load_deepseek2_attention_layer_tensors(dir.path(), 0).unwrap();
+        assert_eq!(loaded.layer, 0);
+        assert_eq!(loaded.len(), 8);
+        assert!(loaded.get("blk.0.ffn_gate_exps.weight").is_none());
+        let q_a = loaded.get("blk.0.attn_q_a.weight").unwrap();
+        assert_eq!(q_a.dims, vec![2, 2]);
+        assert_eq!(q_a.values, vec![0.0, 0.1, 0.2, 0.3]);
+        let output = loaded.get("blk.0.attn_output.weight").unwrap();
+        assert_eq!(output.values[0], 7.0);
     }
 }

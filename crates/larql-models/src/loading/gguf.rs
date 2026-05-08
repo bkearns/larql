@@ -168,6 +168,14 @@ impl GgufTensorInfo {
 // GGUF reader
 // ═══════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone)]
+pub struct LoadedGgufTensor {
+    pub name: String,
+    pub dims: Vec<u64>,
+    pub tensor_type: u32,
+    pub values: Vec<f32>,
+}
+
 pub struct GgufFile {
     pub metadata: HashMap<String, GgufValue>,
     pub tensor_infos: Vec<GgufTensorInfo>,
@@ -254,6 +262,81 @@ impl GgufFile {
         ModelError,
     > {
         self.load_tensors_filtered(&|_| false)
+    }
+
+    /// Load one tensor's raw payload, dequantized to f32, preserving GGUF dimensions.
+    ///
+    /// Unlike `load_tensors_filtered`, this supports higher-rank tensors such as
+    /// Kimi/DeepSeek2 packed MLA weights (`[cols, rows, heads]`) and is intended
+    /// for manifest-backed runtime loaders that need a bounded tensor subset.
+    pub fn load_tensor_data_by_name(&self, name: &str) -> Result<LoadedGgufTensor, ModelError> {
+        let info = self
+            .tensor_infos
+            .iter()
+            .find(|info| info.name == name || normalize_gguf_key(&info.name) == name)
+            .ok_or_else(|| ModelError::Parse(format!("GGUF tensor not found: {name}")))?;
+
+        let file = std::fs::File::open(&self.path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let raw = self.tensor_bytes(info, &mmap)?;
+        let n_elements: usize = info.dims.iter().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(usize::try_from(*dim).map_err(|_| {
+                ModelError::Parse(format!(
+                    "tensor {}: dim {} exceeds usize on this platform",
+                    info.name, dim
+                ))
+            })?)
+            .ok_or_else(|| {
+                ModelError::Parse(format!("tensor {}: element count overflow", info.name))
+            })
+        })?;
+        let values = dequantize(raw, info.tensor_type, n_elements)?;
+
+        Ok(LoadedGgufTensor {
+            name: info.name.clone(),
+            dims: info.dims.clone(),
+            tensor_type: info.tensor_type,
+            values,
+        })
+    }
+
+    fn tensor_bytes<'a>(
+        &self,
+        info: &GgufTensorInfo,
+        mmap: &'a memmap2::Mmap,
+    ) -> Result<&'a [u8], ModelError> {
+        let abs_offset = self.data_offset.checked_add(info.offset).ok_or_else(|| {
+            ModelError::Parse(format!(
+                "tensor {}: data_offset {} + tensor offset {} overflows u64",
+                info.name, self.data_offset, info.offset,
+            ))
+        })?;
+        let n_elements: u64 = info.dims.iter().product();
+
+        let data_size = tensor_data_size(info.tensor_type, n_elements as usize)?;
+        let abs_offset_usize = usize::try_from(abs_offset).map_err(|_| {
+            ModelError::Parse(format!(
+                "tensor {}: absolute offset {} exceeds usize on this platform",
+                info.name, abs_offset,
+            ))
+        })?;
+        let end = abs_offset_usize.checked_add(data_size).ok_or_else(|| {
+            ModelError::Parse(format!(
+                "tensor {}: offset {} + size {} overflows usize",
+                info.name, abs_offset_usize, data_size,
+            ))
+        })?;
+        if end > mmap.len() {
+            return Err(ModelError::Parse(format!(
+                "tensor {} data out of bounds (offset {} + size {} > file {})",
+                info.name,
+                abs_offset,
+                data_size,
+                mmap.len()
+            )));
+        }
+
+        Ok(&mmap[abs_offset_usize..end])
     }
 
     /// Load tensors, skipping normalized keys before reading/dequantizing tensor data.
@@ -740,6 +823,51 @@ mod tests {
         assert_eq!(down[[1, 1]], 6.0);
         assert_eq!(down[[1, 2]], 7.0);
         assert_eq!(down[[1, 3]], 8.0);
+    }
+
+    #[test]
+    fn test_load_tensor_data_by_name_returns_3d_flat_payload() {
+        use std::io::{Seek, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny3d.gguf");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        file.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&1u64.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+
+        let name = b"blk.0.attn_q_b.weight";
+        file.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(name).unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&2u64.to_le_bytes()).unwrap();
+        file.write_all(&3u64.to_le_bytes()).unwrap();
+        file.write_all(&4u64.to_le_bytes()).unwrap();
+        file.write_all(&crate::quant::ggml::TYPE_F32.to_le_bytes())
+            .unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+
+        let pos = file.stream_position().unwrap();
+        let aligned = pos.div_ceil(32) * 32;
+        file.write_all(&vec![0u8; (aligned - pos) as usize])
+            .unwrap();
+        for v in 1u32..=24 {
+            file.write_all(&(v as f32).to_le_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let tensor = gguf
+            .load_tensor_data_by_name("blk.0.attn_q_b.weight")
+            .unwrap();
+        assert_eq!(tensor.name, "blk.0.attn_q_b.weight");
+        assert_eq!(tensor.dims, vec![2, 3, 4]);
+        assert_eq!(tensor.tensor_type, crate::quant::ggml::TYPE_F32);
+        assert_eq!(tensor.values.len(), 24);
+        assert_eq!(tensor.values[0], 1.0);
+        assert_eq!(tensor.values[23], 24.0);
     }
 
     #[test]

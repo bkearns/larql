@@ -8,6 +8,7 @@
 
 pub mod block;
 pub mod decode;
+pub mod gguf_manifest;
 pub mod gpu;
 pub mod gqa;
 pub mod rope;
@@ -47,6 +48,10 @@ pub use block::{
 pub use decode::{
     gqa_attention_decode_step, run_attention_block_decode_step,
     run_attention_block_decode_step_backend, KvCache,
+};
+pub use gguf_manifest::{
+    load_deepseek2_attention_manifest_plan, Deepseek2AttentionLayerPlan,
+    Deepseek2AttentionManifestPlan, GgufAttentionTensorRef,
 };
 pub use gpu::{
     q4_attention_proj, run_attention_block_gpu, run_attention_with_kv,
